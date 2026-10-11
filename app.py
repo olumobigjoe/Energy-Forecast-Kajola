@@ -11,7 +11,7 @@ DATA_DIR = Path(__file__).parent
 DATA_FILE = DATA_DIR / "kajola_dataset_2024_2025.csv"
 FORECAST_FILE = DATA_DIR / "test_forecasts.csv"
 
-st.title("🔋 Kajola AI-Enhanced Energy Storage Simulator")
+st.title("🔋 Kajola Energy Storage Simulator")
 st.caption("Research prototype • Kajola, Nigeria • Hourly data, 2024–2025")
 st.info(
     "This dashboard simulates an assumed battery dispatch policy using the supplied load and solar-generation data. "
