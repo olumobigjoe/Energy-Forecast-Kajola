@@ -11,7 +11,7 @@ DATA_DIR = Path(__file__).parent
 DATA_FILE = DATA_DIR / "kajola_dataset_2024_2025.csv"
 FORECAST_FILE = DATA_DIR / "test_forecasts.csv"
 
-st.title("🔋 Kajola Energy Storage Simulator")
+st.title("🔋 Kajola AI-Enhanced Energy Storage Simulator")
 st.caption("Research prototype • Kajola, Nigeria • Hourly data, 2024–2025")
 st.info(
     "This dashboard simulates an assumed battery dispatch policy using the supplied load and solar-generation data. "
@@ -26,7 +26,15 @@ def load_data():
     data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
     for col in ["Load_kW", "Solar_Gen_kW"]:
         data[col] = pd.to_numeric(data[col], errors="coerce")
-    data = data.dropna(subset=["Timestamp", "Load_kW", "Solar_Gen_kW"]).sort_values("Timestamp")
+    data = data.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
+
+    # Preserve the hourly timeline: forward-fill gaps in the two energy-balance
+    # inputs, consistent with the stated preprocessing approach. Do not back-fill
+    # leading missing values with future observations.
+    data["Load_was_imputed"] = data["Load_kW"].isna()
+    data["Solar_was_imputed"] = data["Solar_Gen_kW"].isna()
+    data[["Load_kW", "Solar_Gen_kW"]] = data[["Load_kW", "Solar_Gen_kW"]].ffill()
+    data = data.dropna(subset=["Load_kW", "Solar_Gen_kW"]).reset_index(drop=True)
     return data
 
 @st.cache_data
@@ -83,13 +91,32 @@ def simulate_ess(frame, capacity_kwh, max_charge_kw, max_discharge_kw,
             "SOC_kWh": soc, "SOC_before_kWh": soc_before,
         })
     result = pd.DataFrame(rows)
-    result["Load_Energy_kWh"] = result["Load_kW"] # each row represents one hour
+    # Each row represents one hour: hourly kW values numerically equal kWh per interval.
+    result["Load_Energy_kWh"] = result["Load_kW"]
+    result["Solar_Energy_kWh"] = result["Solar_Gen_kW"]
     result["Unserved_Energy_kWh"] = result["Unserved_Load_kW"]
     result["Served_Load_kW"] = result["Load_kW"] - result["Unserved_Load_kW"]
+
+    # Conservation residuals should be approximately zero in every hour.
+    result["Load_Balance_Residual_kW"] = (
+        result["Load_kW"] - result["Direct_Solar_to_Load_kW"]
+        - result["Battery_Discharge_to_Load_kW"] - result["Unserved_Load_kW"]
+    )
+    result["Solar_Balance_Residual_kW"] = (
+        result["Solar_Gen_kW"] - result["Direct_Solar_to_Load_kW"]
+        - result["Battery_Charge_Input_kW"] - result["Curtailed_Solar_kW"]
+    )
     return result
 
 data = load_data()
 forecast = load_forecasts()
+imputed_load_count = int(data["Load_was_imputed"].sum()) if "Load_was_imputed" in data else 0
+imputed_solar_count = int(data["Solar_was_imputed"].sum()) if "Solar_was_imputed" in data else 0
+st.caption(
+    f"Data preparation: forward-filled {imputed_load_count} missing load values and "
+    f"{imputed_solar_count} missing solar-generation values to preserve the hourly timeline. "
+    "Leading missing values, if any, are not filled from future observations."
+)
 
 with st.sidebar:
     st.header("Simulation settings")
@@ -165,6 +192,27 @@ served_pct = (load_served / total_load * 100) if total_load > 0 else 0.0
 charge_stored = battery_charge * charge_eff
 battery_internal_loss = battery_charge * (1-charge_eff) + (battery_discharge / max(discharge_eff, 1e-9) - battery_discharge)
 
+# Automated internal consistency and constraint checks.
+soc_min_kwh = capacity * min_soc / 100.0
+soc_max_kwh = capacity * max_soc / 100.0
+load_balance_max = float(result["Load_Balance_Residual_kW"].abs().max())
+solar_balance_max = float(result["Solar_Balance_Residual_kW"].abs().max())
+soc_low_violation = max(soc_min_kwh - float(result["SOC_kWh"].min()), 0.0)
+soc_high_violation = max(float(result["SOC_kWh"].max()) - soc_max_kwh, 0.0)
+charge_limit_violation = max(float(result["Battery_Charge_Input_kW"].max()) - charge_power, 0.0)
+discharge_limit_violation = max(float(result["Battery_Discharge_to_Load_kW"].max()) - discharge_power, 0.0)
+tol = 1e-6
+validation_checks = [
+    ("Load energy balance", load_balance_max <= tol, f"Max absolute residual = {load_balance_max:.8f} kW"),
+    ("Solar energy balance", solar_balance_max <= tol, f"Max absolute residual = {solar_balance_max:.8f} kW"),
+    ("Minimum SOC limit", soc_low_violation <= tol, f"Violation = {soc_low_violation:.8f} kWh"),
+    ("Maximum SOC limit", soc_high_violation <= tol, f"Violation = {soc_high_violation:.8f} kWh"),
+    ("Charging power limit", charge_limit_violation <= tol, f"Violation = {charge_limit_violation:.8f} kW"),
+    ("Discharging power limit", discharge_limit_violation <= tol, f"Violation = {discharge_limit_violation:.8f} kW"),
+    ("Non-negative SOC and unserved load", (result["SOC_kWh"].min() >= -tol and result["Unserved_Load_kW"].min() >= -tol), "Checked all hours"),
+    ("Non-negative curtailed solar", result["Curtailed_Solar_kW"].min() >= -tol, "Checked all hours"),
+]
+
 st.subheader("Simulation summary")
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total load", f"{total_load:,.1f} kWh")
@@ -185,7 +233,18 @@ st.caption(
     "Each record is treated as one hour."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(["Energy balance", "Battery operation", "Forecast comparison", "Results table"])
+with st.expander("Automated model validation checks", expanded=True):
+    passed = sum(1 for _, ok, _ in validation_checks if ok)
+    st.write(f"**Checks passed: {passed}/{len(validation_checks)}**")
+    validation_df = pd.DataFrame(validation_checks, columns=["Check", "Passed", "Diagnostic"])
+    st.dataframe(validation_df, use_container_width=True, hide_index=True)
+    if passed == len(validation_checks):
+        st.success("The implemented energy-balance and battery-limit checks pass for this simulation run.")
+    else:
+        st.error("At least one validation check failed. Investigate before interpreting the results.")
+    st.caption("These are internal consistency checks, not independent validation against physical battery measurements.")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Energy balance", "Battery operation", "Forecast comparison", "Results table", "Validation"])
 
 with tab1:
     fig = go.Figure()
@@ -261,6 +320,10 @@ with tab4:
         "battery_discharge_to_load_kWh": battery_discharge,
         "curtailed_solar_kWh": curtailed,
         "estimated_battery_conversion_loss_kWh": battery_internal_loss,
+        "max_abs_load_balance_residual_kW": load_balance_max,
+        "max_abs_solar_balance_residual_kW": solar_balance_max,
+        "validation_checks_passed": sum(1 for _, ok, _ in validation_checks if ok),
+        "validation_checks_total": len(validation_checks),
         "capacity_kWh": capacity,
         "charge_power_kW": charge_power,
         "discharge_power_kW": discharge_power,
@@ -283,4 +346,23 @@ with st.expander("How to interpret the results"):
     - This simple dispatch rule charges only from solar surplus; it does not use grid charging, tariffs, degradation, temperature-dependent performance, or an inverter model.
     - The dataset's recorded solar generation and the assumed battery parameters should be validated before results are treated as engineering findings.
     """)
+with tab5:
+    st.markdown("### Hourly balance diagnostics")
+    st.write("Load balance: load = direct solar serving load + battery discharge + unserved load.")
+    st.latex(r"L_t = S^{direct}_t + B^{discharge}_t + U_t")
+    st.write("Solar balance: solar generation = direct solar to load + battery charging input + curtailed solar.")
+    st.latex(r"S_t = S^{direct}_t + B^{charge,input}_t + C_t")
+    balance_plot = result[["Timestamp", "Load_Balance_Residual_kW", "Solar_Balance_Residual_kW"]].melt(
+        id_vars="Timestamp", var_name="Balance", value_name="Residual (kW)"
+    )
+    fig_balance = px.line(balance_plot, x="Timestamp", y="Residual (kW)", color="Balance",
+                          title="Hourly energy-balance residuals (should remain at zero)")
+    st.plotly_chart(fig_balance, use_container_width=True)
+    st.markdown("### Battery-limit diagnostics")
+    st.write(f"Allowed SOC range: **{soc_min_kwh:.2f}–{soc_max_kwh:.2f} kWh**.")
+    st.write(f"Observed SOC range: **{result['SOC_kWh'].min():.2f}–{result['SOC_kWh'].max():.2f} kWh**.")
+    st.write(f"Maximum charge input: **{result['Battery_Charge_Input_kW'].max():.2f} kW**; limit: **{charge_power:.2f} kW**.")
+    st.write(f"Maximum discharge output: **{result['Battery_Discharge_to_Load_kW'].max():.2f} kW**; limit: **{discharge_power:.2f} kW**.")
+    st.dataframe(validation_df, use_container_width=True, hide_index=True)
+
 st.caption("Research integrity note: do not report the scenario outputs as measured field outcomes. Document assumptions and validate the dispatch model before final thesis submission.")

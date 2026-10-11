@@ -36,3 +36,13 @@ then
 - Default battery parameters are illustrative and must be justified/validated for the research.
 - Forecast-based scenarios are limited to the Version 3 held-out test period and use recorded solar generation aligned by timestamp.
 - Scenario outputs are simulated estimates, not measured real-world ESS performance.
+
+
+## Validation additions
+The dashboard includes automatic checks for:
+- hourly load and solar energy-balance residuals;
+- minimum and maximum battery state of charge;
+- charging and discharging power limits;
+- non-negative SOC, unserved load and curtailed solar.
+
+A passing check confirms internal accounting consistency under the coded assumptions. It does not independently validate the model against a real battery or establish measured field performance.
