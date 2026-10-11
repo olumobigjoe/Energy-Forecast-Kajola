@@ -46,3 +46,14 @@ The dashboard includes automatic checks for:
 - non-negative SOC, unserved load and curtailed solar.
 
 A passing check confirms internal accounting consistency under the coded assumptions. It does not independently validate the model against a real battery or establish measured field performance.
+
+
+## Compare 25, 50, 75 and 100 kWh batteries
+1. Start the app and leave the default comparison assumptions unchanged unless your study requires otherwise: 15 kW charge and discharge limits, 50% initial SOC, 10% minimum SOC, 95% maximum SOC, and 95% charging/discharging efficiencies.
+2. In the sidebar, select **LSTM forecast (test period)**.
+3. Keep the same simulation dates for every run. The supplied LSTM forecast covers **2025-09-13 08:00 to 2025-12-31 23:00** (2,632 hourly records). The date selector may remain at its full range; the forecast merge limits the actual LSTM scenario to its available timestamps.
+4. Open the **Capacity comparison** tab. It runs 25, 50, 75 and 100 kWh capacities automatically, with both power limits fixed at 15 kW. Only capacity changes across those four scenarios.
+5. Compare unserved energy, curtailed solar, estimated conversion losses, SOC minimum/maximum/final values, hours at SOC limits, and validation results. Use the CSV download to save the comparison.
+6. If you change efficiency or SOC settings, change them only when intentionally running a separate experiment; keep them fixed within each capacity comparison.
+
+The comparison table is computed by the app from the supplied LSTM forecast and recorded solar-generation data. It is not a claim of real-world battery performance. Do not compare it directly with the earlier full-dataset observed-load simulation as if both used the same time period: the LSTM scenario is only the held-out test period.

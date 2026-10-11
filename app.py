@@ -11,7 +11,7 @@ DATA_DIR = Path(__file__).parent
 DATA_FILE = DATA_DIR / "kajola_dataset_2024_2025.csv"
 FORECAST_FILE = DATA_DIR / "test_forecasts.csv"
 
-st.title("🔋 Kajola Energy Storage Simulator")
+st.title("🔋 Kajola AI-Enhanced Energy Storage Simulator")
 st.caption("Research prototype • Kajola, Nigeria • Hourly data, 2024–2025")
 st.info(
     "This dashboard simulates an assumed battery dispatch policy using the supplied load and solar-generation data. "
@@ -130,13 +130,14 @@ with st.sidebar:
     load_source = st.selectbox(
         "Load series",
         ["Observed load (dataset)", "LSTM forecast (test period)", "Hybrid forecast (test period)"],
-        index=0
+        index=1
     )
     st.divider()
     st.subheader("Battery assumptions")
     capacity = st.slider("Usable battery capacity (kWh)", 5.0, 500.0, 50.0, 5.0)
     charge_power = st.slider("Maximum charging power (kW)", 1.0, 200.0, 15.0, 1.0)
     discharge_power = st.slider("Maximum discharging power (kW)", 1.0, 200.0, 15.0, 1.0)
+    st.caption("Scenario comparison tests 25, 50, 75 and 100 kWh at the same 15 kW power limits, using the same dates, efficiencies and SOC settings.")
     initial_soc = st.slider("Initial state of charge (%)", 0, 100, 50, 5)
     min_soc = st.slider("Minimum state of charge (%)", 0, 50, 10, 5)
     max_soc = st.slider("Maximum state of charge (%)", 50, 100, 95, 5)
@@ -244,7 +245,7 @@ with st.expander("Automated model validation checks", expanded=True):
         st.error("At least one validation check failed. Investigate before interpreting the results.")
     st.caption("These are internal consistency checks, not independent validation against physical battery measurements.")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Energy balance", "Battery operation", "Forecast comparison", "Results table", "Validation"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Energy balance", "Battery operation", "Forecast comparison", "Results table", "Validation", "Capacity comparison"])
 
 with tab1:
     fig = go.Figure()
@@ -364,5 +365,96 @@ with tab5:
     st.write(f"Maximum charge input: **{result['Battery_Charge_Input_kW'].max():.2f} kW**; limit: **{charge_power:.2f} kW**.")
     st.write(f"Maximum discharge output: **{result['Battery_Discharge_to_Load_kW'].max():.2f} kW**; limit: **{discharge_power:.2f} kW**.")
     st.dataframe(validation_df, use_container_width=True, hide_index=True)
+
+
+with tab6:
+    st.subheader("Controlled battery-capacity comparison")
+    st.markdown(
+        "This comparison holds the selected load series, simulation dates, 15 kW charge/discharge limits, "
+        "initial SOC, SOC bounds, and charge/discharge efficiencies constant. Only battery capacity changes. "
+        "For the requested study, keep **LSTM forecast (test period)** selected in the sidebar."
+    )
+    if not load_source.startswith("LSTM"):
+        st.warning("The requested experiment uses the LSTM forecast. Select 'LSTM forecast (test period)' in the sidebar; then review this tab.")
+    else:
+        scenario_rows = []
+        scenario_hourly = {}
+        comparison_capacities = [25.0, 50.0, 75.0, 100.0]
+        # The requested comparison fixes both power limits at 15 kW regardless of the sidebar power sliders.
+        fixed_power_kw = 15.0
+        for cap_kwh in comparison_capacities:
+            sr = simulate_ess(
+                load_frame, cap_kwh, fixed_power_kw, fixed_power_kw, initial_soc, min_soc, max_soc,
+                charge_eff, discharge_eff, policy="solar_surplus_first"
+            )
+            scenario_hourly[int(cap_kwh)] = sr
+            t_load = float(sr["Load_Energy_kWh"].sum())
+            t_solar = float(sr["Solar_Energy_kWh"].sum())
+            no_ess = float(np.maximum(sr["Load_kW"] - np.minimum(sr["Load_kW"], sr["Solar_Gen_kW"]), 0).sum())
+            unmet = float(sr["Unserved_Energy_kWh"].sum())
+            chg = float(sr["Battery_Charge_Input_kW"].sum())
+            dis = float(sr["Battery_Discharge_to_Load_kW"].sum())
+            curt = float(sr["Curtailed_Solar_kW"].sum())
+            loss = chg * (1 - charge_eff) + (dis / max(discharge_eff, 1e-9) - dis)
+            min_allowed = cap_kwh * min_soc / 100.0
+            max_allowed = cap_kwh * max_soc / 100.0
+            load_res = float(sr["Load_Balance_Residual_kW"].abs().max())
+            solar_res = float(sr["Solar_Balance_Residual_kW"].abs().max())
+            soc_low = max(min_allowed - float(sr["SOC_kWh"].min()), 0.0)
+            soc_high = max(float(sr["SOC_kWh"].max()) - max_allowed, 0.0)
+            chg_violation = max(float(sr["Battery_Charge_Input_kW"].max()) - fixed_power_kw, 0.0)
+            dis_violation = max(float(sr["Battery_Discharge_to_Load_kW"].max()) - fixed_power_kw, 0.0)
+            checks = [
+                load_res <= tol, solar_res <= tol, soc_low <= tol, soc_high <= tol,
+                chg_violation <= tol, dis_violation <= tol,
+                sr["SOC_kWh"].min() >= -tol and sr["Unserved_Load_kW"].min() >= -tol,
+                sr["Curtailed_Solar_kW"].min() >= -tol,
+            ]
+            soc = sr["SOC_kWh"]
+            scenario_rows.append({
+                "Capacity_kWh": int(cap_kwh), "Hours": len(sr), "Load_kWh": t_load,
+                "Unserved_without_ESS_kWh": no_ess, "Unserved_with_ESS_kWh": unmet,
+                "Unserved_reduction_pct": ((no_ess-unmet)/no_ess*100) if no_ess else 0.0,
+                "Load_served_pct": ((t_load-unmet)/t_load*100) if t_load else 0.0,
+                "Solar_generation_kWh": t_solar, "Curtailed_solar_kWh": curt,
+                "Battery_charge_input_kWh": chg, "Battery_delivered_kWh": dis,
+                "Estimated_conversion_losses_kWh": loss,
+                "SOC_min_observed_kWh": float(soc.min()), "SOC_max_observed_kWh": float(soc.max()),
+                "SOC_final_kWh": float(soc.iloc[-1]),
+                "Hours_at_min_SOC": int(np.isclose(soc.to_numpy(), min_allowed, atol=1e-5).sum()),
+                "Hours_at_max_SOC": int(np.isclose(soc.to_numpy(), max_allowed, atol=1e-5).sum()),
+                "Max_load_balance_residual_kW": load_res,
+                "Max_solar_balance_residual_kW": solar_res,
+                "Validation_checks_passed": int(sum(checks)), "Validation_checks_total": len(checks),
+            })
+        comparison = pd.DataFrame(scenario_rows)
+        st.dataframe(comparison.round(4), use_container_width=True, hide_index=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_unmet = px.bar(comparison, x="Capacity_kWh", y="Unserved_with_ESS_kWh", text_auto=".2f",
+                               title="Unserved energy by battery capacity", labels={"Capacity_kWh":"Battery capacity (kWh)", "Unserved_with_ESS_kWh":"Unserved energy (kWh)"})
+            st.plotly_chart(fig_unmet, use_container_width=True)
+        with c2:
+            fig_curt = px.bar(comparison, x="Capacity_kWh", y="Curtailed_solar_kWh", text_auto=".2f",
+                              title="Curtailed solar by battery capacity", labels={"Capacity_kWh":"Battery capacity (kWh)", "Curtailed_solar_kWh":"Curtailed solar (kWh)"})
+            st.plotly_chart(fig_curt, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            fig_loss = px.bar(comparison, x="Capacity_kWh", y="Estimated_conversion_losses_kWh", text_auto=".2f",
+                              title="Estimated battery conversion losses", labels={"Capacity_kWh":"Battery capacity (kWh)", "Estimated_conversion_losses_kWh":"Losses (kWh)"})
+            st.plotly_chart(fig_loss, use_container_width=True)
+        with c4:
+            fig_soc_comp = go.Figure()
+            for cap_kwh, sr in scenario_hourly.items():
+                fig_soc_comp.add_trace(go.Scatter(x=sr["Timestamp"], y=sr["SOC_kWh"], name=f"{cap_kwh} kWh", mode="lines"))
+            fig_soc_comp.update_layout(title="SOC behaviour by capacity", xaxis_title="Time", yaxis_title="SOC (kWh)")
+            st.plotly_chart(fig_soc_comp, use_container_width=True)
+        st.markdown("**Validation by scenario**")
+        st.dataframe(comparison[["Capacity_kWh", "Max_load_balance_residual_kW", "Max_solar_balance_residual_kW", "Validation_checks_passed", "Validation_checks_total", "SOC_min_observed_kWh", "SOC_max_observed_kWh", "Hours_at_min_SOC", "Hours_at_max_SOC"]].round(6), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download capacity comparison (CSV)", comparison.to_csv(index=False).encode("utf-8"),
+            "kajola_ess_capacity_comparison.csv", "text/csv"
+        )
+        st.caption("The comparison computes new simulation outputs when the app runs. No scenario result is assumed in advance. Internal checks do not replace validation against physical battery measurements.")
 
 st.caption("Research integrity note: do not report the scenario outputs as measured field outcomes. Document assumptions and validate the dispatch model before final thesis submission.")
