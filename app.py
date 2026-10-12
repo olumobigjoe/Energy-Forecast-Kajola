@@ -4,457 +4,301 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-st.set_page_config(page_title="Kajola ESS Simulator", page_icon="🔋", layout="wide")
-
+st.set_page_config(page_title="Kajola ESS Forecast Comparison", page_icon="🔋", layout="wide")
 DATA_DIR = Path(__file__).parent
 DATA_FILE = DATA_DIR / "kajola_dataset_2024_2025.csv"
 FORECAST_FILE = DATA_DIR / "test_forecasts.csv"
+TOL = 1e-6
 
-st.title("🔋 Kajola Energy Storage Simulator")
-st.caption("Research prototype • Kajola, Nigeria • Hourly data, 2024–2025")
-st.info(
-    "This dashboard simulates an assumed battery dispatch policy using the supplied load and solar-generation data. "
-    "It is a research scenario model, not a validated engineering design. Review all assumptions before using results in a thesis."
+st.title("Kajola AI-Enhanced Energy Storage Simulator")
+st.caption("Research prototype | One-hour-ahead forecast comparison | Kajola, Nigeria")
+st.warning(
+    "This is a simplified scenario simulation, not a validated battery engineering design. "
+    "Forecasting metrics and ESS operational metrics are different evaluations. Review the assumptions below before using results in a thesis."
 )
 
 @st.cache_data
-def load_data():
-    if not DATA_FILE.exists():
-        raise FileNotFoundError(f"Missing {DATA_FILE.name}. Put it beside app.py.")
-    data = pd.read_csv(DATA_FILE)
-    data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
-    for col in ["Load_kW", "Solar_Gen_kW"]:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-    data = data.dropna(subset=["Timestamp"]).sort_values("Timestamp").reset_index(drop=True)
-
-    # Preserve the hourly timeline: forward-fill gaps in the two energy-balance
-    # inputs, consistent with the stated preprocessing approach. Do not back-fill
-    # leading missing values with future observations.
-    data["Load_was_imputed"] = data["Load_kW"].isna()
-    data["Solar_was_imputed"] = data["Solar_Gen_kW"].isna()
-    data[["Load_kW", "Solar_Gen_kW"]] = data[["Load_kW", "Solar_Gen_kW"]].ffill()
-    data = data.dropna(subset=["Load_kW", "Solar_Gen_kW"]).reset_index(drop=True)
-    return data
-
-@st.cache_data
-def load_forecasts():
-    if not FORECAST_FILE.exists():
-        return None
+def load_inputs():
+    if not DATA_FILE.exists() or not FORECAST_FILE.exists():
+        raise FileNotFoundError("Both kajola_dataset_2024_2025.csv and test_forecasts.csv must be beside app.py.")
+    d = pd.read_csv(DATA_FILE)
     f = pd.read_csv(FORECAST_FILE)
+    d["Timestamp"] = pd.to_datetime(d["Timestamp"], errors="coerce")
     f["Timestamp"] = pd.to_datetime(f["Timestamp"], errors="coerce")
-    return f.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+    for c in ["Load_kW", "Solar_Gen_kW"]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    forecast_cols = ["Actual_Load_kW", "Naive_Persistence_kW", "ANN_kW", "LSTM_kW", "Diff-ANN-BiLSTM_kW"]
+    for c in forecast_cols:
+        f[c] = pd.to_numeric(f[c], errors="coerce")
+    d = d.dropna(subset=["Timestamp"]).sort_values("Timestamp").drop_duplicates("Timestamp").reset_index(drop=True)
+    # Preserve chronology; forward fill only from prior observations, never backfill from future values.
+    d[["Load_kW", "Solar_Gen_kW"]] = d[["Load_kW", "Solar_Gen_kW"]].ffill()
+    d = d.dropna(subset=["Load_kW", "Solar_Gen_kW"]).reset_index(drop=True)
+    f = f.dropna(subset=["Timestamp"] + forecast_cols).sort_values("Timestamp").drop_duplicates("Timestamp").reset_index(drop=True)
+    merged = f.merge(d[["Timestamp", "Load_kW", "Solar_Gen_kW"]], on="Timestamp", how="left", validate="one_to_one")
+    if merged["Solar_Gen_kW"].isna().any() or merged["Load_kW"].isna().any():
+        raise ValueError("Some forecast timestamps could not be matched to observed load and solar data.")
+    # Confirm supplied actual series matches the original data at each forecast timestamp.
+    mismatch = (merged["Actual_Load_kW"] - merged["Load_kW"]).abs().max()
+    return d, merged, float(mismatch)
 
-def simulate_ess(frame, capacity_kwh, max_charge_kw, max_discharge_kw,
-                 initial_soc_pct, min_soc_pct, max_soc_pct,
-                 charge_efficiency, discharge_efficiency, policy):
-    """Hourly energy-balance model. Solar serves load first; surplus charges battery."""
-    out = frame.copy().reset_index(drop=True)
-    n = len(out)
-    soc_min = capacity_kwh * min_soc_pct / 100.0
-    soc_max = capacity_kwh * max_soc_pct / 100.0
-    soc = min(max(capacity_kwh * initial_soc_pct / 100.0, soc_min), soc_max)
 
+def metric_rows(f):
+    actual = f["Actual_Load_kW"].to_numpy(dtype=float)
     rows = []
-    for i, row in out.iterrows():
-        load = max(float(row["Simulated_Load_kW"]), 0.0)
-        solar = max(float(row["Solar_Gen_kW"]), 0.0)
-        direct_solar = min(load, solar)
-        remaining_load = load - direct_solar
-        solar_surplus = max(solar - load, 0.0)
+    for label, col in [("Naïve persistence", "Naive_Persistence_kW"), ("ANN", "ANN_kW"),
+                       ("LSTM", "LSTM_kW"), ("Differencing–ANN–Bi-LSTM", "Diff-ANN-BiLSTM_kW")]:
+        pred = f[col].to_numpy(dtype=float)
+        nz = np.abs(actual) > 1e-12
+        rows.append({
+            "Model": label,
+            "MAE_kW": mean_absolute_error(actual, pred),
+            "RMSE_kW": mean_squared_error(actual, pred) ** 0.5,
+            "MAPE_percent_nonzero_actuals": float(np.mean(np.abs((actual[nz] - pred[nz]) / actual[nz])) * 100) if nz.any() else np.nan,
+            "R2": r2_score(actual, pred),
+        })
+    return pd.DataFrame(rows)
 
-        charge_input = 0.0
-        discharge_to_load = 0.0
-        unserved = remaining_load
-        curtailment = solar_surplus
+
+def simulate_dispatch(frame, capacity_kwh, max_charge_kw, max_discharge_kw,
+                      initial_soc_pct, min_soc_pct, max_soc_pct,
+                      charge_efficiency, discharge_efficiency, forecast_col=None):
+    """Simulate actual load/solar balance. Forecast limits planned discharge; actual load determines realized unmet demand.
+
+    Policy: solar serves actual load first; actual solar surplus charges the battery. During a deficit,
+    a forecast-informed controller may discharge up to its predicted net-load requirement, but never
+    more than the actual residual load, power limit, or available battery energy. forecast_col=None
+    is an actual-load-informed reference case, not a deployable forecast controller.
+    """
+    x = frame.reset_index(drop=True).copy()
+    cap = float(capacity_kwh)
+    soc_min = cap * float(min_soc_pct) / 100
+    soc_max = cap * float(max_soc_pct) / 100
+    soc = float(np.clip(cap * float(initial_soc_pct) / 100, soc_min, soc_max))
+    rows = []
+    for _, row in x.iterrows():
+        actual = max(float(row["Actual_Load_kW"]), 0.0)
+        solar = max(float(row["Solar_Gen_kW"]), 0.0)
+        forecast = actual if forecast_col is None else max(float(row[forecast_col]), 0.0)
+        direct = min(actual, solar)
+        residual_actual = max(actual - direct, 0.0)
+        solar_surplus = max(solar - actual, 0.0)
+        charge = discharge = 0.0
+        unserved = residual_actual
+        curtailed = solar_surplus
         soc_before = soc
 
-        # Charge only from surplus recorded solar generation.
+        # Charge from realized solar surplus; identical rule for all forecast models.
         if solar_surplus > 0 and soc < soc_max:
-            max_input_by_soc = max((soc_max - soc) / max(charge_efficiency, 1e-9), 0.0)
-            charge_input = min(solar_surplus, max_charge_kw, max_input_by_soc)
-            soc += charge_input * charge_efficiency
-            curtailment = solar_surplus - charge_input
-
-        # Discharge only to serve residual demand; no grid charging in this policy.
-        elif remaining_load > 0 and soc > soc_min:
-            available_output_by_soc = max((soc - soc_min) * discharge_efficiency, 0.0)
-            discharge_to_load = min(remaining_load, max_discharge_kw, available_output_by_soc)
-            soc -= discharge_to_load / max(discharge_efficiency, 1e-9)
-            unserved = remaining_load - discharge_to_load
+            max_input_from_soc = max((soc_max - soc) / max(charge_efficiency, 1e-12), 0.0)
+            charge = min(solar_surplus, max_charge_kw, max_input_from_soc)
+            soc += charge * charge_efficiency
+            curtailed = solar_surplus - charge
+        elif residual_actual > 0 and soc > soc_min:
+            predicted_residual = max(forecast - solar, 0.0)
+            planned_discharge = residual_actual if forecast_col is None else predicted_residual
+            available_output = max((soc - soc_min) * discharge_efficiency, 0.0)
+            discharge = min(residual_actual, planned_discharge, max_discharge_kw, available_output)
+            soc -= discharge / max(discharge_efficiency, 1e-12)
+            unserved = residual_actual - discharge
 
         rows.append({
-            "Timestamp": row["Timestamp"], "Load_kW": load, "Solar_Gen_kW": solar,
-            "Direct_Solar_to_Load_kW": direct_solar, "Residual_Load_before_Battery_kW": remaining_load,
-            "Battery_Charge_Input_kW": charge_input, "Battery_Discharge_to_Load_kW": discharge_to_load,
-            "Unserved_Load_kW": max(unserved, 0.0), "Curtailed_Solar_kW": max(curtailment, 0.0),
-            "SOC_kWh": soc, "SOC_before_kWh": soc_before,
+            "Timestamp": row["Timestamp"], "Actual_Load_kW": actual,
+            "Forecast_Load_kW": forecast, "Solar_Gen_kW": solar,
+            "Direct_Solar_to_Load_kW": direct,
+            "Residual_Load_before_Battery_kW": residual_actual,
+            "Battery_Charge_Input_kW": charge, "Battery_Discharge_to_Load_kW": discharge,
+            "Unserved_Load_kW": max(unserved, 0.0), "Curtailed_Solar_kW": max(curtailed, 0.0),
+            "SOC_before_kWh": soc_before, "SOC_kWh": soc,
         })
-    result = pd.DataFrame(rows)
-    # Each row represents one hour: hourly kW values numerically equal kWh per interval.
-    result["Load_Energy_kWh"] = result["Load_kW"]
-    result["Solar_Energy_kWh"] = result["Solar_Gen_kW"]
-    result["Unserved_Energy_kWh"] = result["Unserved_Load_kW"]
-    result["Served_Load_kW"] = result["Load_kW"] - result["Unserved_Load_kW"]
 
-    # Conservation residuals should be approximately zero in every hour.
-    result["Load_Balance_Residual_kW"] = (
-        result["Load_kW"] - result["Direct_Solar_to_Load_kW"]
-        - result["Battery_Discharge_to_Load_kW"] - result["Unserved_Load_kW"]
-    )
-    result["Solar_Balance_Residual_kW"] = (
-        result["Solar_Gen_kW"] - result["Direct_Solar_to_Load_kW"]
-        - result["Battery_Charge_Input_kW"] - result["Curtailed_Solar_kW"]
-    )
-    return result
+    r = pd.DataFrame(rows)
+    # Hourly time steps: kW values numerically equal kWh per interval.
+    r["Load_Energy_kWh"] = r["Actual_Load_kW"]
+    r["Solar_Energy_kWh"] = r["Solar_Gen_kW"]
+    r["Unserved_Energy_kWh"] = r["Unserved_Load_kW"]
+    r["Served_Load_kW"] = r["Actual_Load_kW"] - r["Unserved_Load_kW"]
+    r["Load_Balance_Residual_kW"] = r["Actual_Load_kW"] - r["Direct_Solar_to_Load_kW"] - r["Battery_Discharge_to_Load_kW"] - r["Unserved_Load_kW"]
+    r["Solar_Balance_Residual_kW"] = r["Solar_Gen_kW"] - r["Direct_Solar_to_Load_kW"] - r["Battery_Charge_Input_kW"] - r["Curtailed_Solar_kW"]
+    r["SOC_Balance_Residual_kWh"] = r["SOC_kWh"] - (r["SOC_before_kWh"] + r["Battery_Charge_Input_kW"] * charge_efficiency - r["Battery_Discharge_to_Load_kW"] / max(discharge_efficiency, 1e-12))
+    return r
 
-data = load_data()
-forecast = load_forecasts()
-imputed_load_count = int(data["Load_was_imputed"].sum()) if "Load_was_imputed" in data else 0
-imputed_solar_count = int(data["Solar_was_imputed"].sum()) if "Solar_was_imputed" in data else 0
-st.caption(
-    f"Data preparation: forward-filled {imputed_load_count} missing load values and "
-    f"{imputed_solar_count} missing solar-generation values to preserve the hourly timeline. "
-    "Leading missing values, if any, are not filled from future observations."
-)
 
+def summarize(result, capacity_kwh, max_charge_kw, max_discharge_kw, min_soc_pct, max_soc_pct, charge_eff, discharge_eff):
+    load_total = float(result["Load_Energy_kWh"].sum())
+    solar_total = float(result["Solar_Energy_kWh"].sum())
+    no_ess = float(np.maximum(result["Actual_Load_kW"] - result["Solar_Gen_kW"], 0).sum())
+    unserved = float(result["Unserved_Energy_kWh"].sum())
+    charge = float(result["Battery_Charge_Input_kW"].sum())
+    discharge = float(result["Battery_Discharge_to_Load_kW"].sum())
+    loss = charge * (1-charge_eff) + (discharge / max(discharge_eff, 1e-12) - discharge)
+    soc_min = capacity_kwh * min_soc_pct / 100
+    soc_max = capacity_kwh * max_soc_pct / 100
+    checks = [
+        ("Load balance", result["Load_Balance_Residual_kW"].abs().max() <= TOL),
+        ("Solar balance", result["Solar_Balance_Residual_kW"].abs().max() <= TOL),
+        ("SOC transition balance", result["SOC_Balance_Residual_kWh"].abs().max() <= TOL),
+        ("Minimum SOC", result["SOC_kWh"].min() >= soc_min-TOL),
+        ("Maximum SOC", result["SOC_kWh"].max() <= soc_max+TOL),
+        ("Charge power limit", result["Battery_Charge_Input_kW"].max() <= max_charge_kw+TOL),
+        ("Discharge power limit", result["Battery_Discharge_to_Load_kW"].max() <= max_discharge_kw+TOL),
+        ("Non-negative values", result[["SOC_kWh", "Unserved_Load_kW", "Curtailed_Solar_kW", "Battery_Charge_Input_kW", "Battery_Discharge_to_Load_kW"]].min().min() >= -TOL),
+    ]
+    return {
+        "Hours": len(result), "Load_kWh": load_total, "Solar_generation_kWh": solar_total,
+        "Unserved_without_ESS_kWh": no_ess, "Unserved_with_ESS_kWh": unserved,
+        "Unserved_reduction_vs_no_ESS_pct": (no_ess-unserved)/no_ess*100 if no_ess else 0,
+        "Load_served_pct": (load_total-unserved)/load_total*100 if load_total else 0,
+        "Battery_charge_input_kWh": charge, "Battery_delivered_kWh": discharge,
+        "Curtailed_solar_kWh": float(result["Curtailed_Solar_kW"].sum()),
+        "Estimated_conversion_losses_kWh": loss,
+        "SOC_min_observed_kWh": float(result["SOC_kWh"].min()), "SOC_max_observed_kWh": float(result["SOC_kWh"].max()),
+        "SOC_final_kWh": float(result["SOC_kWh"].iloc[-1]),
+        "Hours_at_min_SOC": int(np.isclose(result["SOC_kWh"], soc_min, atol=1e-5).sum()),
+        "Hours_at_max_SOC": int(np.isclose(result["SOC_kWh"], soc_max, atol=1e-5).sum()),
+        "Max_load_balance_residual_kW": float(result["Load_Balance_Residual_kW"].abs().max()),
+        "Max_solar_balance_residual_kW": float(result["Solar_Balance_Residual_kW"].abs().max()),
+        "Max_SOC_balance_residual_kWh": float(result["SOC_Balance_Residual_kWh"].abs().max()),
+        "Validation_checks_passed": sum(ok for _, ok in checks), "Validation_checks_total": len(checks),
+        "Validation_details": checks,
+    }
+
+try:
+    data, forecasts, actual_mismatch = load_inputs()
+except Exception as e:
+    st.error(f"Input-data problem: {e}")
+    st.stop()
+
+if actual_mismatch > 1e-6:
+    st.error(f"Forecast actual-load column differs from source dataset (maximum difference {actual_mismatch:.6g} kW). Check the forecast file.")
+    st.stop()
+
+start_default = forecasts["Timestamp"].min().date()
+end_default = forecasts["Timestamp"].max().date()
 with st.sidebar:
     st.header("Simulation settings")
-    date_min = data["Timestamp"].min().date()
-    date_max = data["Timestamp"].max().date()
-    start_date, end_date = st.date_input(
-        "Simulation period", value=(date_min, date_max),
-        min_value=date_min, max_value=date_max
-    )
-    st.caption("For faster initial testing, select a shorter period such as 7–30 days.")
-    load_source = st.selectbox(
-        "Load series",
-        ["Observed load (dataset)", "LSTM forecast (test period)", "Hybrid forecast (test period)"],
-        index=1
-    )
-    st.divider()
-    st.subheader("Battery assumptions")
-    capacity = st.slider("Usable battery capacity (kWh)", 5.0, 500.0, 50.0, 5.0)
-    charge_power = st.slider("Maximum charging power (kW)", 1.0, 200.0, 15.0, 1.0)
-    discharge_power = st.slider("Maximum discharging power (kW)", 1.0, 200.0, 15.0, 1.0)
-    st.caption("Scenario comparison tests 25, 50, 75 and 100 kWh at the same 15 kW power limits, using the same dates, efficiencies and SOC settings.")
-    initial_soc = st.slider("Initial state of charge (%)", 0, 100, 50, 5)
-    min_soc = st.slider("Minimum state of charge (%)", 0, 50, 10, 5)
-    max_soc = st.slider("Maximum state of charge (%)", 50, 100, 95, 5)
-    charge_eff = st.slider("Charging efficiency (%)", 50, 100, 95, 1) / 100.0
-    discharge_eff = st.slider("Discharging efficiency (%)", 50, 100, 95, 1) / 100.0
-    run_button = st.button("Run ESS simulation", type="primary", use_container_width=True)
+    st.caption("Forecast comparison uses the held-out test period by default.")
+    start_date, end_date = st.date_input("Test-period dates", value=(start_default, end_default), min_value=start_default, max_value=end_default)
+    capacity = st.slider("Battery capacity (kWh)", 5, 200, 50, 5)
+    charge_power = st.slider("Maximum charge power (kW)", 1, 50, 15, 1)
+    discharge_power = st.slider("Maximum discharge power (kW)", 1, 50, 15, 1)
+    initial_soc = st.slider("Initial SOC (%)", 0, 100, 50, 5)
+    min_soc = st.slider("Minimum SOC (%)", 0, 50, 10, 5)
+    max_soc = st.slider("Maximum SOC (%)", 50, 100, 95, 5)
+    charge_eff = st.slider("Charge efficiency (%)", 50, 100, 95, 1) / 100
+    discharge_eff = st.slider("Discharge efficiency (%)", 50, 100, 95, 1) / 100
 
 if start_date > end_date:
-    st.error("The start date must be on or before the end date.")
+    st.error("Start date must be on or before end date.")
     st.stop()
 if min_soc >= max_soc:
-    st.error("Minimum state of charge must be below maximum state of charge.")
+    st.error("Minimum SOC must be below maximum SOC.")
     st.stop()
 
-if load_source != "Observed load (dataset)":
-    if forecast is None:
-        st.error("Forecast CSV is missing. Use observed load or add test_forecasts.csv beside app.py.")
-        st.stop()
-    pred_col = "LSTM_kW" if load_source.startswith("LSTM") else "Diff-ANN-BiLSTM_kW"
-    load_frame = forecast[["Timestamp", "Actual_Load_kW", pred_col]].merge(
-        data[["Timestamp", "Solar_Gen_kW"]], on="Timestamp", how="left"
-    )
-    load_frame = load_frame.rename(columns={pred_col: "Simulated_Load_kW"})
-    load_frame = load_frame[["Timestamp", "Simulated_Load_kW", "Solar_Gen_kW"]]
-else:
-    load_frame = data[["Timestamp", "Load_kW", "Solar_Gen_kW"]].rename(columns={"Load_kW": "Simulated_Load_kW"})
-
-load_frame = load_frame[
-    (load_frame["Timestamp"].dt.date >= start_date) &
-    (load_frame["Timestamp"].dt.date <= end_date)
-].dropna(subset=["Simulated_Load_kW", "Solar_Gen_kW"]).sort_values("Timestamp").reset_index(drop=True)
-
-if load_frame.empty:
-    st.warning("No rows are available for the selected dates and load series. The LSTM/hybrid options only cover the held-out test period.")
+frame = forecasts[(forecasts["Timestamp"].dt.date >= start_date) & (forecasts["Timestamp"].dt.date <= end_date)].copy().reset_index(drop=True)
+if frame.empty:
+    st.warning("No test-period rows for the selected dates.")
     st.stop()
 
-# Simulation runs on every rerun so changing a slider updates the outputs.
-result = simulate_ess(
-    load_frame, capacity, charge_power, discharge_power, initial_soc, min_soc, max_soc,
-    charge_eff, discharge_eff, policy="solar_surplus_first"
-)
-total_load = float(result["Load_Energy_kWh"].sum())
-unserved_no_ess = float(np.maximum(result["Load_kW"] - np.minimum(result["Load_kW"], result["Solar_Gen_kW"]), 0).sum())
-unserved_with_ess = float(result["Unserved_Energy_kWh"].sum())
-solar_energy = float(result["Solar_Gen_kW"].sum())
-battery_charge = float(result["Battery_Charge_Input_kW"].sum())
-battery_discharge = float(result["Battery_Discharge_to_Load_kW"].sum())
-curtailed = float(result["Curtailed_Solar_kW"].sum())
-load_served = max(total_load - unserved_with_ess, 0.0)
-unmet_reduction = ((unserved_no_ess - unserved_with_ess) / unserved_no_ess * 100) if unserved_no_ess > 0 else 0.0
-served_pct = (load_served / total_load * 100) if total_load > 0 else 0.0
-# Estimated conversion loss inside battery based on hourly energy balance.
-charge_stored = battery_charge * charge_eff
-battery_internal_loss = battery_charge * (1-charge_eff) + (battery_discharge / max(discharge_eff, 1e-9) - battery_discharge)
+metrics = metric_rows(frame)
+st.subheader("Forecast accuracy on the held-out test period")
+st.caption(f"{len(frame):,} hourly observations | {frame['Timestamp'].min()} to {frame['Timestamp'].max()} | MAE/RMSE/MAPE are based on actual load versus each forecast.")
+st.dataframe(metrics.round(4), use_container_width=True, hide_index=True)
 
-# Automated internal consistency and constraint checks.
-soc_min_kwh = capacity * min_soc / 100.0
-soc_max_kwh = capacity * max_soc / 100.0
-load_balance_max = float(result["Load_Balance_Residual_kW"].abs().max())
-solar_balance_max = float(result["Solar_Balance_Residual_kW"].abs().max())
-soc_low_violation = max(soc_min_kwh - float(result["SOC_kWh"].min()), 0.0)
-soc_high_violation = max(float(result["SOC_kWh"].max()) - soc_max_kwh, 0.0)
-charge_limit_violation = max(float(result["Battery_Charge_Input_kW"].max()) - charge_power, 0.0)
-discharge_limit_violation = max(float(result["Battery_Discharge_to_Load_kW"].max()) - discharge_power, 0.0)
-tol = 1e-6
-validation_checks = [
-    ("Load energy balance", load_balance_max <= tol, f"Max absolute residual = {load_balance_max:.8f} kW"),
-    ("Solar energy balance", solar_balance_max <= tol, f"Max absolute residual = {solar_balance_max:.8f} kW"),
-    ("Minimum SOC limit", soc_low_violation <= tol, f"Violation = {soc_low_violation:.8f} kWh"),
-    ("Maximum SOC limit", soc_high_violation <= tol, f"Violation = {soc_high_violation:.8f} kWh"),
-    ("Charging power limit", charge_limit_violation <= tol, f"Violation = {charge_limit_violation:.8f} kW"),
-    ("Discharging power limit", discharge_limit_violation <= tol, f"Violation = {discharge_limit_violation:.8f} kW"),
-    ("Non-negative SOC and unserved load", (result["SOC_kWh"].min() >= -tol and result["Unserved_Load_kW"].min() >= -tol), "Checked all hours"),
-    ("Non-negative curtailed solar", result["Curtailed_Solar_kW"].min() >= -tol, "Checked all hours"),
-]
+model_cols = {"LSTM": "LSTM_kW", "Hybrid (Differencing–ANN–Bi-LSTM)": "Diff-ANN-BiLSTM_kW"}
+results = {}
+summaries = []
+for model_name, col in model_cols.items():
+    results[model_name] = simulate_dispatch(frame, capacity, charge_power, discharge_power, initial_soc, min_soc, max_soc, charge_eff, discharge_eff, col)
+    sm = summarize(results[model_name], capacity, charge_power, discharge_power, min_soc, max_soc, charge_eff, discharge_eff)
+    sm["Controller"] = model_name
+    summaries.append(sm)
+# Actual-load-informed reference benchmark, included only as an upper-information reference.
+results["Actual-load reference"] = simulate_dispatch(frame, capacity, charge_power, discharge_power, initial_soc, min_soc, max_soc, charge_eff, discharge_eff, None)
+ref_summary = summarize(results["Actual-load reference"], capacity, charge_power, discharge_power, min_soc, max_soc, charge_eff, discharge_eff)
+ref_summary["Controller"] = "Actual-load reference (benchmark only)"
+summaries.append(ref_summary)
+summary_df = pd.DataFrame([{k:v for k,v in s.items() if k != "Validation_details"} for s in summaries])
 
-st.subheader("Simulation summary")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total load", f"{total_load:,.1f} kWh")
-c2.metric("Unserved energy with ESS", f"{unserved_with_ess:,.1f} kWh",
-          delta=f"{unserved_no_ess-unserved_with_ess:,.1f} kWh vs no battery", delta_color="normal")
-c3.metric("Load served", f"{served_pct:.2f}%")
-c4.metric("Solar energy available", f"{solar_energy:,.1f} kWh")
+st.subheader("ESS outcomes evaluated against actual observed load")
+st.caption("Both forecast controllers use the same actual demand and recorded solar series for realized energy accounting. The forecast limits planned battery discharge; actual demand determines how much load remains unserved. The actual-load reference is an idealized comparison, not a forecast controller.")
+show_cols = ["Controller", "Unserved_without_ESS_kWh", "Unserved_with_ESS_kWh", "Unserved_reduction_vs_no_ESS_pct", "Load_served_pct", "Battery_charge_input_kWh", "Battery_delivered_kWh", "Curtailed_solar_kWh", "Estimated_conversion_losses_kWh", "SOC_final_kWh", "Validation_checks_passed", "Validation_checks_total"]
+st.dataframe(summary_df[show_cols].round(3), use_container_width=True, hide_index=True)
 
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("Battery charged", f"{battery_charge:,.1f} kWh")
-c6.metric("Battery delivered", f"{battery_discharge:,.1f} kWh")
-c7.metric("Solar curtailed", f"{curtailed:,.1f} kWh")
-c8.metric("Estimated battery conversion loss", f"{battery_internal_loss:,.1f} kWh")
+for s in summaries:
+    name = s["Controller"]
+    if s["Validation_checks_passed"] != s["Validation_checks_total"]:
+        st.error(f"Validation failed for {name}: {s['Validation_checks_passed']}/{s['Validation_checks_total']} checks passed.")
 
-st.caption(
-    f"Assumptions: {capacity:.0f} kWh capacity; charge/discharge limits {charge_power:.0f}/{discharge_power:.0f} kW; "
-    f"efficiencies {charge_eff:.0%}/{discharge_eff:.0%}; SOC range {min_soc}%–{max_soc}%. "
-    "Each record is treated as one hour."
-)
+st.caption("Battery assumptions are scenario inputs, not measured Kajola battery specifications. The dispatch rule is intentionally simple and should be described as a forecast-limited heuristic, not an optimized energy-management controller.")
 
-with st.expander("Automated model validation checks", expanded=True):
-    passed = sum(1 for _, ok, _ in validation_checks if ok)
-    st.write(f"**Checks passed: {passed}/{len(validation_checks)}**")
-    validation_df = pd.DataFrame(validation_checks, columns=["Check", "Passed", "Diagnostic"])
-    st.dataframe(validation_df, use_container_width=True, hide_index=True)
-    if passed == len(validation_checks):
-        st.success("The implemented energy-balance and battery-limit checks pass for this simulation run.")
-    else:
-        st.error("At least one validation check failed. Investigate before interpreting the results.")
-    st.caption("These are internal consistency checks, not independent validation against physical battery measurements.")
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Energy balance", "Battery operation", "Forecast comparison", "Results table", "Validation", "Capacity comparison"])
-
+tab1, tab2, tab3, tab4 = st.tabs(["Forecast comparison", "ESS time series", "Battery capacity sensitivity", "Validation & downloads"])
 with tab1:
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=result["Timestamp"], y=result["Load_kW"], name="Load", line=dict(width=1.5)))
-    fig.add_trace(go.Scatter(x=result["Timestamp"], y=result["Solar_Gen_kW"], name="Solar generation", line=dict(width=1.2)))
-    fig.add_trace(go.Scatter(x=result["Timestamp"], y=result["Battery_Discharge_to_Load_kW"], name="Battery discharge", line=dict(width=1.2)))
-    fig.add_trace(go.Scatter(x=result["Timestamp"], y=result["Unserved_Load_kW"], name="Unserved load", line=dict(width=1.2, dash="dot")))
-    fig.update_layout(title="Hourly load, solar generation and ESS contribution", xaxis_title="Time", yaxis_title="Power (kW)", legend_title="Series")
+    fig.add_trace(go.Scatter(x=frame["Timestamp"], y=frame["Actual_Load_kW"], name="Actual load", line=dict(width=1.5)))
+    fig.add_trace(go.Scatter(x=frame["Timestamp"], y=frame["LSTM_kW"], name="LSTM forecast", line=dict(width=1.2)))
+    fig.add_trace(go.Scatter(x=frame["Timestamp"], y=frame["Diff-ANN-BiLSTM_kW"], name="Hybrid forecast", line=dict(width=1.2)))
+    fig.update_layout(title="Actual load versus forecasts", xaxis_title="Time", yaxis_title="Load (kW)")
     st.plotly_chart(fig, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**No-ESS versus ESS unserved energy**")
-        compare = pd.DataFrame({
-            "Scenario": ["Without ESS", "With ESS"],
-            "Unserved energy (kWh)": [unserved_no_ess, unserved_with_ess]
-        })
-        fig2 = px.bar(compare, x="Scenario", y="Unserved energy (kWh)", text_auto=".2f")
-        st.plotly_chart(fig2, use_container_width=True)
-    with col2:
-        st.markdown("**Hourly unserved load**")
-        fig3 = px.line(result, x="Timestamp", y="Unserved_Load_kW", labels={"Unserved_Load_kW":"Unserved load (kW)", "Timestamp":"Time"})
-        st.plotly_chart(fig3, use_container_width=True)
+    e = metrics[metrics["Model"].isin(["LSTM", "Differencing–ANN–Bi-LSTM"])][["Model", "MAE_kW", "RMSE_kW", "MAPE_percent_nonzero_actuals"]].melt(id_vars="Model", var_name="Metric", value_name="Error")
+    st.plotly_chart(px.bar(e, x="Metric", y="Error", color="Model", barmode="group", title="LSTM versus hybrid forecasting errors"), use_container_width=True)
 
 with tab2:
     fig_soc = go.Figure()
-    fig_soc.add_trace(go.Scatter(x=result["Timestamp"], y=result["SOC_kWh"], name="Battery SOC (kWh)", fill="tozeroy"))
+    for name in ["LSTM", "Hybrid (Differencing–ANN–Bi-LSTM)"]:
+        r = results[name]
+        fig_soc.add_trace(go.Scatter(x=r["Timestamp"], y=r["SOC_kWh"], name=f"{name} SOC"))
     fig_soc.add_hline(y=capacity*min_soc/100, line_dash="dash", annotation_text="Minimum SOC")
     fig_soc.add_hline(y=capacity*max_soc/100, line_dash="dash", annotation_text="Maximum SOC")
-    fig_soc.update_layout(title="Battery state of charge", xaxis_title="Time", yaxis_title="Stored energy (kWh)")
+    fig_soc.update_layout(title="Battery state of charge by forecast controller", xaxis_title="Time", yaxis_title="Stored energy (kWh)")
     st.plotly_chart(fig_soc, use_container_width=True)
-
-    fig_power = go.Figure()
-    fig_power.add_trace(go.Bar(x=result["Timestamp"], y=result["Battery_Charge_Input_kW"], name="Charge input"))
-    fig_power.add_trace(go.Bar(x=result["Timestamp"], y=-result["Battery_Discharge_to_Load_kW"], name="Discharge to load"))
-    fig_power.update_layout(title="Battery charge (+) and discharge (−)", xaxis_title="Time", yaxis_title="Power (kW)", barmode="relative")
-    st.plotly_chart(fig_power, use_container_width=True)
+    u = pd.DataFrame([{"Controller": n, "Unserved energy (kWh)": float(results[n]["Unserved_Energy_kWh"].sum())} for n in results])
+    st.plotly_chart(px.bar(u, x="Controller", y="Unserved energy (kWh)", title="Unserved energy by controller"), use_container_width=True)
+    st.plotly_chart(px.line(results["LSTM"], x="Timestamp", y="Unserved_Load_kW", title="Hourly unserved load — LSTM controller"), use_container_width=True)
+    st.plotly_chart(px.line(results["Hybrid (Differencing–ANN–Bi-LSTM)"], x="Timestamp", y="Unserved_Load_kW", title="Hourly unserved load — hybrid controller"), use_container_width=True)
 
 with tab3:
-    st.markdown("The LSTM/hybrid forecast choices cover the held-out test period only. Forecast-based simulation is an illustrative operational scenario; solar generation is aligned from the recorded dataset.")
-    if forecast is not None:
-        merged = forecast[["Timestamp", "Actual_Load_kW", "LSTM_kW", "Diff-ANN-BiLSTM_kW"]].merge(
-            data[["Timestamp", "Solar_Gen_kW"]], on="Timestamp", how="left"
-        )
-        merged = merged[(merged["Timestamp"].dt.date >= start_date) & (merged["Timestamp"].dt.date <= end_date)]
-        if not merged.empty:
-            figf = go.Figure()
-            figf.add_trace(go.Scatter(x=merged["Timestamp"], y=merged["Actual_Load_kW"], name="Actual load"))
-            figf.add_trace(go.Scatter(x=merged["Timestamp"], y=merged["LSTM_kW"], name="LSTM forecast"))
-            figf.add_trace(go.Scatter(x=merged["Timestamp"], y=merged["Diff-ANN-BiLSTM_kW"], name="Hybrid forecast"))
-            figf.update_layout(title="Actual load and model forecasts (test period)", xaxis_title="Time", yaxis_title="Load (kW)")
-            st.plotly_chart(figf, use_container_width=True)
-        else:
-            st.warning("Select dates inside the test period to see forecast comparison.")
-    else:
-        st.warning("Forecast file not found.")
+    st.markdown("Battery capacity sensitivity: same test dates, observed demand, solar profile, power limits, SOC bounds, and efficiencies. Only capacity changes between scenarios.")
+    cap_rows = []
+    for cap in [25, 50, 75, 100]:
+        for name, col in model_cols.items():
+            r = simulate_dispatch(frame, cap, 15, 15, initial_soc, min_soc, max_soc, charge_eff, discharge_eff, col)
+            sm = summarize(r, cap, 15, 15, min_soc, max_soc, charge_eff, discharge_eff)
+            sm["Capacity_kWh"] = cap
+            sm["Controller"] = name
+            cap_rows.append({k:v for k,v in sm.items() if k != "Validation_details"})
+    cap_df = pd.DataFrame(cap_rows)
+    st.dataframe(cap_df.round(3), use_container_width=True, hide_index=True)
+    st.plotly_chart(px.bar(cap_df, x="Capacity_kWh", y="Unserved_with_ESS_kWh", color="Controller", barmode="group", title="Unserved actual energy by battery capacity"), use_container_width=True)
+    st.plotly_chart(px.bar(cap_df, x="Capacity_kWh", y="Curtailed_solar_kWh", color="Controller", barmode="group", title="Curtailed solar by battery capacity"), use_container_width=True)
+    st.download_button("Download capacity sensitivity CSV", cap_df.to_csv(index=False).encode("utf-8"), "kajola_lstm_hybrid_capacity_sensitivity.csv", "text/csv")
 
 with tab4:
-    st.dataframe(result, use_container_width=True, hide_index=True)
-    csv = result.to_csv(index=False).encode("utf-8")
-    st.download_button("Download hourly ESS results (CSV)", csv, "kajola_ess_simulation_results.csv", "text/csv")
-    summary = pd.DataFrame([{
-        "start": str(result["Timestamp"].min()),
-        "end": str(result["Timestamp"].max()),
-        "hours_simulated": len(result),
-        "load_energy_kWh": total_load,
-        "solar_energy_kWh": solar_energy,
-        "unserved_no_ESS_kWh": unserved_no_ess,
-        "unserved_with_ESS_kWh": unserved_with_ess,
-        "unserved_energy_reduction_percent": unmet_reduction,
-        "load_served_percent": served_pct,
-        "battery_charge_input_kWh": battery_charge,
-        "battery_discharge_to_load_kWh": battery_discharge,
-        "curtailed_solar_kWh": curtailed,
-        "estimated_battery_conversion_loss_kWh": battery_internal_loss,
-        "max_abs_load_balance_residual_kW": load_balance_max,
-        "max_abs_solar_balance_residual_kW": solar_balance_max,
-        "validation_checks_passed": sum(1 for _, ok, _ in validation_checks if ok),
-        "validation_checks_total": len(validation_checks),
-        "capacity_kWh": capacity,
-        "charge_power_kW": charge_power,
-        "discharge_power_kW": discharge_power,
-        "initial_SOC_percent": initial_soc,
-        "min_SOC_percent": min_soc,
-        "max_SOC_percent": max_soc,
-        "charge_efficiency": charge_eff,
-        "discharge_efficiency": discharge_eff
-    }])
-    st.download_button("Download simulation summary (CSV)", summary.to_csv(index=False).encode("utf-8"),
-                       "kajola_ess_summary.csv", "text/csv")
+    detail_rows = []
+    for s in summaries:
+        for label, ok in s["Validation_details"]:
+            detail_rows.append({"Controller": s["Controller"], "Check": label, "Passed": bool(ok)})
+    detail_df = pd.DataFrame(detail_rows)
+    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+    st.write("Maximum absolute residuals:")
+    st.dataframe(summary_df[["Controller", "Max_load_balance_residual_kW", "Max_solar_balance_residual_kW", "Max_SOC_balance_residual_kWh"]].round(10), use_container_width=True, hide_index=True)
+    st.download_button("Download forecasting metrics CSV", metrics.to_csv(index=False).encode("utf-8"), "kajola_forecasting_metrics_v3.csv", "text/csv")
+    st.download_button("Download ESS summary CSV", summary_df.to_csv(index=False).encode("utf-8"), "kajola_lstm_hybrid_ess_summary.csv", "text/csv")
+    for name, r in results.items():
+        safe = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("–", "-")
+        st.download_button(f"Download hourly results — {name}", r.to_csv(index=False).encode("utf-8"), f"kajola_hourly_{safe}.csv", "text/csv", key=f"dl_{safe}")
 
-with st.expander("How to interpret the results"):
+with st.expander("Model assumptions and interpretation"):
     st.markdown("""
-    - **Unserved energy** is the estimated electricity demand not met by direct solar generation or battery discharge.
-    - **Load served (%)** is the proportion of recorded/simulated load served under the stated assumptions.
-    - **Battery charge/discharge** are hourly energy quantities because each input record represents one hour.
-    - **Solar curtailed** is solar generation left unused after serving load and charging the battery.
-    - **Battery conversion loss** estimates charge and discharge conversion losses from the selected efficiencies.
-    - This simple dispatch rule charges only from solar surplus; it does not use grid charging, tariffs, degradation, temperature-dependent performance, or an inverter model.
-    - The dataset's recorded solar generation and the assumed battery parameters should be validated before results are treated as engineering findings.
+    - Each row represents a one-hour interval; hourly kW values are treated numerically as kWh per interval.
+    - Solar serves the **actual observed load** first. Any actual solar surplus may charge the battery.
+    - During an actual deficit, the LSTM or hybrid forecast limits planned battery discharge; the controller never discharges more than actual residual demand, the power limit, or available battery energy.
+    - This is a transparent forecast-limited heuristic, not an optimized controller. Forecast errors can affect dispatch, but the result depends on the selected rule.
+    - The actual-load reference uses actual demand to guide discharge and is only an idealized benchmark, not a deployable forecast-based controller.
+    - Recorded solar generation is used as the same exogenous series for both controllers. Future solar forecasting is not included.
+    - No grid charging, tariffs, degradation, temperature-dependent battery behaviour, inverter dynamics, or hardware validation is included.
+    - Passing internal checks demonstrates accounting consistency under the implemented assumptions; it does not prove real-world battery performance.
     """)
-with tab5:
-    st.markdown("### Hourly balance diagnostics")
-    st.write("Load balance: load = direct solar serving load + battery discharge + unserved load.")
-    st.latex(r"L_t = S^{direct}_t + B^{discharge}_t + U_t")
-    st.write("Solar balance: solar generation = direct solar to load + battery charging input + curtailed solar.")
-    st.latex(r"S_t = S^{direct}_t + B^{charge,input}_t + C_t")
-    balance_plot = result[["Timestamp", "Load_Balance_Residual_kW", "Solar_Balance_Residual_kW"]].melt(
-        id_vars="Timestamp", var_name="Balance", value_name="Residual (kW)"
-    )
-    fig_balance = px.line(balance_plot, x="Timestamp", y="Residual (kW)", color="Balance",
-                          title="Hourly energy-balance residuals (should remain at zero)")
-    st.plotly_chart(fig_balance, use_container_width=True)
-    st.markdown("### Battery-limit diagnostics")
-    st.write(f"Allowed SOC range: **{soc_min_kwh:.2f}–{soc_max_kwh:.2f} kWh**.")
-    st.write(f"Observed SOC range: **{result['SOC_kWh'].min():.2f}–{result['SOC_kWh'].max():.2f} kWh**.")
-    st.write(f"Maximum charge input: **{result['Battery_Charge_Input_kW'].max():.2f} kW**; limit: **{charge_power:.2f} kW**.")
-    st.write(f"Maximum discharge output: **{result['Battery_Discharge_to_Load_kW'].max():.2f} kW**; limit: **{discharge_power:.2f} kW**.")
-    st.dataframe(validation_df, use_container_width=True, hide_index=True)
-
-
-with tab6:
-    st.subheader("Controlled battery-capacity comparison")
-    st.markdown(
-        "This comparison holds the selected load series, simulation dates, 15 kW charge/discharge limits, "
-        "initial SOC, SOC bounds, and charge/discharge efficiencies constant. Only battery capacity changes. "
-        "For the requested study, keep **LSTM forecast (test period)** selected in the sidebar."
-    )
-    if not load_source.startswith("LSTM"):
-        st.warning("The requested experiment uses the LSTM forecast. Select 'LSTM forecast (test period)' in the sidebar; then review this tab.")
-    else:
-        scenario_rows = []
-        scenario_hourly = {}
-        comparison_capacities = [25.0, 50.0, 75.0, 100.0]
-        # The requested comparison fixes both power limits at 15 kW regardless of the sidebar power sliders.
-        fixed_power_kw = 15.0
-        for cap_kwh in comparison_capacities:
-            sr = simulate_ess(
-                load_frame, cap_kwh, fixed_power_kw, fixed_power_kw, initial_soc, min_soc, max_soc,
-                charge_eff, discharge_eff, policy="solar_surplus_first"
-            )
-            scenario_hourly[int(cap_kwh)] = sr
-            t_load = float(sr["Load_Energy_kWh"].sum())
-            t_solar = float(sr["Solar_Energy_kWh"].sum())
-            no_ess = float(np.maximum(sr["Load_kW"] - np.minimum(sr["Load_kW"], sr["Solar_Gen_kW"]), 0).sum())
-            unmet = float(sr["Unserved_Energy_kWh"].sum())
-            chg = float(sr["Battery_Charge_Input_kW"].sum())
-            dis = float(sr["Battery_Discharge_to_Load_kW"].sum())
-            curt = float(sr["Curtailed_Solar_kW"].sum())
-            loss = chg * (1 - charge_eff) + (dis / max(discharge_eff, 1e-9) - dis)
-            min_allowed = cap_kwh * min_soc / 100.0
-            max_allowed = cap_kwh * max_soc / 100.0
-            load_res = float(sr["Load_Balance_Residual_kW"].abs().max())
-            solar_res = float(sr["Solar_Balance_Residual_kW"].abs().max())
-            soc_low = max(min_allowed - float(sr["SOC_kWh"].min()), 0.0)
-            soc_high = max(float(sr["SOC_kWh"].max()) - max_allowed, 0.0)
-            chg_violation = max(float(sr["Battery_Charge_Input_kW"].max()) - fixed_power_kw, 0.0)
-            dis_violation = max(float(sr["Battery_Discharge_to_Load_kW"].max()) - fixed_power_kw, 0.0)
-            checks = [
-                load_res <= tol, solar_res <= tol, soc_low <= tol, soc_high <= tol,
-                chg_violation <= tol, dis_violation <= tol,
-                sr["SOC_kWh"].min() >= -tol and sr["Unserved_Load_kW"].min() >= -tol,
-                sr["Curtailed_Solar_kW"].min() >= -tol,
-            ]
-            soc = sr["SOC_kWh"]
-            scenario_rows.append({
-                "Capacity_kWh": int(cap_kwh), "Hours": len(sr), "Load_kWh": t_load,
-                "Unserved_without_ESS_kWh": no_ess, "Unserved_with_ESS_kWh": unmet,
-                "Unserved_reduction_pct": ((no_ess-unmet)/no_ess*100) if no_ess else 0.0,
-                "Load_served_pct": ((t_load-unmet)/t_load*100) if t_load else 0.0,
-                "Solar_generation_kWh": t_solar, "Curtailed_solar_kWh": curt,
-                "Battery_charge_input_kWh": chg, "Battery_delivered_kWh": dis,
-                "Estimated_conversion_losses_kWh": loss,
-                "SOC_min_observed_kWh": float(soc.min()), "SOC_max_observed_kWh": float(soc.max()),
-                "SOC_final_kWh": float(soc.iloc[-1]),
-                "Hours_at_min_SOC": int(np.isclose(soc.to_numpy(), min_allowed, atol=1e-5).sum()),
-                "Hours_at_max_SOC": int(np.isclose(soc.to_numpy(), max_allowed, atol=1e-5).sum()),
-                "Max_load_balance_residual_kW": load_res,
-                "Max_solar_balance_residual_kW": solar_res,
-                "Validation_checks_passed": int(sum(checks)), "Validation_checks_total": len(checks),
-            })
-        comparison = pd.DataFrame(scenario_rows)
-        st.dataframe(comparison.round(4), use_container_width=True, hide_index=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_unmet = px.bar(comparison, x="Capacity_kWh", y="Unserved_with_ESS_kWh", text_auto=".2f",
-                               title="Unserved energy by battery capacity", labels={"Capacity_kWh":"Battery capacity (kWh)", "Unserved_with_ESS_kWh":"Unserved energy (kWh)"})
-            st.plotly_chart(fig_unmet, use_container_width=True)
-        with c2:
-            fig_curt = px.bar(comparison, x="Capacity_kWh", y="Curtailed_solar_kWh", text_auto=".2f",
-                              title="Curtailed solar by battery capacity", labels={"Capacity_kWh":"Battery capacity (kWh)", "Curtailed_solar_kWh":"Curtailed solar (kWh)"})
-            st.plotly_chart(fig_curt, use_container_width=True)
-        c3, c4 = st.columns(2)
-        with c3:
-            fig_loss = px.bar(comparison, x="Capacity_kWh", y="Estimated_conversion_losses_kWh", text_auto=".2f",
-                              title="Estimated battery conversion losses", labels={"Capacity_kWh":"Battery capacity (kWh)", "Estimated_conversion_losses_kWh":"Losses (kWh)"})
-            st.plotly_chart(fig_loss, use_container_width=True)
-        with c4:
-            fig_soc_comp = go.Figure()
-            for cap_kwh, sr in scenario_hourly.items():
-                fig_soc_comp.add_trace(go.Scatter(x=sr["Timestamp"], y=sr["SOC_kWh"], name=f"{cap_kwh} kWh", mode="lines"))
-            fig_soc_comp.update_layout(title="SOC behaviour by capacity", xaxis_title="Time", yaxis_title="SOC (kWh)")
-            st.plotly_chart(fig_soc_comp, use_container_width=True)
-        st.markdown("**Validation by scenario**")
-        st.dataframe(comparison[["Capacity_kWh", "Max_load_balance_residual_kW", "Max_solar_balance_residual_kW", "Validation_checks_passed", "Validation_checks_total", "SOC_min_observed_kWh", "SOC_max_observed_kWh", "Hours_at_min_SOC", "Hours_at_max_SOC"]].round(6), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download capacity comparison (CSV)", comparison.to_csv(index=False).encode("utf-8"),
-            "kajola_ess_capacity_comparison.csv", "text/csv"
-        )
-        st.caption("The comparison computes new simulation outputs when the app runs. No scenario result is assumed in advance. Internal checks do not replace validation against physical battery measurements.")
-
-st.caption("Research integrity note: do not report the scenario outputs as measured field outcomes. Document assumptions and validate the dispatch model before final thesis submission.")
+st.caption("Research integrity: use these outputs as simulation estimates under stated assumptions. Do not describe them as measured field outcomes or claim the hybrid/LSTM is operationally superior without examining the results and limitations.")

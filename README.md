@@ -1,59 +1,55 @@
-# Kajola ESS Simulator (Python + Streamlit)
+# Kajola ESS Forecast Comparison — Reviewed Prototype
 
-## Included
-- `app.py`: interactive battery/solar/load scenario simulator
-- `kajola_dataset_2024_2025.csv`: supplied Kajola hourly dataset
-- `test_forecasts.csv`: Version 3 test forecasts (LSTM, hybrid, ANN and persistence)
-- `requirements.txt`: Python packages
+## Purpose
+Compare the Version 3 LSTM and Differencing–ANN–Bi-LSTM forecasts and examine a transparent forecast-limited battery dispatch scenario using the same actual load and recorded solar-generation series.
+
+## Included files
+- `app.py` — Streamlit dashboard and ESS scenario model.
+- `kajola_dataset_2024_2025.csv` — Kajola hourly dataset.
+- `test_forecasts.csv` — corrected Version 3 held-out test forecasts. Its metrics reproduce the established Version 3 results.
+- `requirements.txt` — Python dependencies.
 
 ## Run on Windows
-1. Extract this folder.
+1. Extract the ZIP.
 2. Open PowerShell in the extracted folder.
-3. Create a virtual environment (recommended):
-   ```powershell
-   py -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-4. Install dependencies:
+3. Install dependencies:
    ```powershell
    python -m pip install -r requirements.txt
    ```
-5. Launch:
+4. Launch:
    ```powershell
-   streamlit run app.py
+   python -m streamlit run app.py
    ```
 
-If PowerShell blocks activation, you can skip activation and run:
-`python -m pip install -r requirements.txt`
-then
-`python -m streamlit run app.py`
+## Forecast test period
+The test forecasts cover 2025-09-13 08:00 through 2025-12-31 23:00 (2,632 hourly rows). The forecast `Actual_Load_kW` values are checked against the original dataset at matching timestamps. The maximum observed mismatch should be zero.
 
-## Model assumptions and limits
-- One row represents one hour.
-- Solar generation serves load first; only solar surplus can charge the battery.
-- Battery discharge serves residual demand subject to power, SOC and efficiency limits.
-- No grid charging, tariffs, degradation, inverter dynamics or forecast uncertainty are included yet.
-- Default battery parameters are illustrative and must be justified/validated for the research.
-- Forecast-based scenarios are limited to the Version 3 held-out test period and use recorded solar generation aligned by timestamp.
-- Scenario outputs are simulated estimates, not measured real-world ESS performance.
+## Dispatch policy
+- Actual observed solar serves actual load first.
+- Actual solar surplus can charge the battery, subject to charging power, capacity, SOC bounds, and charging efficiency.
+- During a deficit, the selected forecast limits the planned discharge amount; actual load limits the amount that can actually serve the load. This means underforecasting can leave additional demand unmet. The rule is a transparent heuristic, not an optimized controller.
+- The `Actual-load reference` is an idealized benchmark using actual demand to guide discharge. It is not a forecast controller and should not be represented as a deployable method.
 
+## Default assumptions
+- Battery capacity: 50 kWh
+- Charge/discharge power: 15 kW each
+- Initial SOC: 50%
+- Minimum/maximum SOC: 10%/95%
+- Charge/discharge efficiencies: 95%/95%
+- Solar generation: recorded data aligned by timestamp
 
-## Validation additions
-The dashboard includes automatic checks for:
-- hourly load and solar energy-balance residuals;
-- minimum and maximum battery state of charge;
-- charging and discharging power limits;
-- non-negative SOC, unserved load and curtailed solar.
+These are scenario assumptions, not confirmed physical specifications for a Kajola installation.
 
-A passing check confirms internal accounting consistency under the coded assumptions. It does not independently validate the model against a real battery or establish measured field performance.
+## Validation checks
+The app checks:
+- load energy balance;
+- solar energy balance;
+- SOC transition balance;
+- minimum and maximum SOC constraints;
+- charge/discharge power limits;
+- non-negative SOC, unserved load, curtailed solar, charge and discharge.
 
+Passing checks establishes internal accounting consistency only. It does not independently validate the model against physical battery measurements.
 
-## Compare 25, 50, 75 and 100 kWh batteries
-1. Start the app and leave the default comparison assumptions unchanged unless your study requires otherwise: 15 kW charge and discharge limits, 50% initial SOC, 10% minimum SOC, 95% maximum SOC, and 95% charging/discharging efficiencies.
-2. In the sidebar, select **LSTM forecast (test period)**.
-3. Keep the same simulation dates for every run. The supplied LSTM forecast covers **2025-09-13 08:00 to 2025-12-31 23:00** (2,632 hourly records). The date selector may remain at its full range; the forecast merge limits the actual LSTM scenario to its available timestamps.
-4. Open the **Capacity comparison** tab. It runs 25, 50, 75 and 100 kWh capacities automatically, with both power limits fixed at 15 kW. Only capacity changes across those four scenarios.
-5. Compare unserved energy, curtailed solar, estimated conversion losses, SOC minimum/maximum/final values, hours at SOC limits, and validation results. Use the CSV download to save the comparison.
-6. If you change efficiency or SOC settings, change them only when intentionally running a separate experiment; keep them fixed within each capacity comparison.
-
-The comparison table is computed by the app from the supplied LSTM forecast and recorded solar-generation data. It is not a claim of real-world battery performance. Do not compare it directly with the earlier full-dataset observed-load simulation as if both used the same time period: the LSTM scenario is only the held-out test period.
+## Research integrity
+The app reports forecast accuracy separately from ESS operational results. Operational outcomes are calculated against actual observed demand for both forecast controllers under the same conditions. Do not claim that one forecast improves real-world reliability unless the assumptions, dispatch rule, comparison baseline, and limitations are clearly documented.
