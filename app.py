@@ -12,7 +12,7 @@ DATA_FILE = DATA_DIR / "kajola_dataset_2024_2025.csv"
 FORECAST_FILE = DATA_DIR / "test_forecasts.csv"
 TOL = 1e-6
 
-st.title("Kajola AI-Enhanced Energy Storage Simulator")
+st.title("Kajola Energy Storage Simulator")
 st.caption("Research prototype | One-hour-ahead forecast comparison | Kajola, Nigeria")
 st.warning(
     "This is a simplified scenario simulation, not a validated battery engineering design. "
